@@ -1,0 +1,61 @@
+import 'dotenv/config';
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
+import firebasePlugin from './plugins/firebase';
+import { authenticate } from './middleware/auth';
+
+const PORT = Number(process.env.PORT ?? 3000);
+const HOST = process.env.HOST ?? '0.0.0.0';
+
+async function main() {
+  // Validate required environment variables up front. Fail fast and loud
+  // rather than discovering the missing key on the first import request.
+  if (!process.env.MINIMAX_API_KEY) {
+    console.error(
+      '[startup] MINIMAX_API_KEY is required. Set it in .env before starting the server.',
+    );
+    process.exit(1);
+  }
+
+  const app = Fastify({
+    logger: {
+      level: process.env.LOG_LEVEL ?? 'info',
+    },
+  });
+
+  await app.register(cors, {
+    origin: true, // dev-friendly; tighten for production
+  });
+
+  await app.register(multipart, {
+    limits: {
+      fileSize: 50 * 1024 * 1024, // 50MB hard cap on import uploads (U2)
+    },
+  });
+
+  await app.register(firebasePlugin);
+
+  // Liveness probe — no auth, no Firestore access. Used by deployment
+  // platforms and for manual smoke testing.
+  app.get('/health', async () => ({ status: 'ok' }));
+
+  // Temporary protected route so we can verify the auth middleware end-to-end
+  // without a real import pipeline yet. Remove once U2 ships its first
+  // protected route.
+  app.get(
+    '/_protected/ping',
+    { preHandler: authenticate },
+    async (request) => ({ uid: request.user?.uid, email: request.user?.email }),
+  );
+
+  try {
+    await app.listen({ port: PORT, host: HOST });
+    app.log.info(`ContextLayer API listening on http://${HOST}:${PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+}
+
+main();
