@@ -3,3 +3,9 @@
 .env.*.local
 node_modules/
 dist/
+
+# Founder export fixture for local import-pipeline testing only.
+# Never commit real conversation exports to source control.
+data-*-batch-*.zip
+*.export.zip
+fixtures/private/

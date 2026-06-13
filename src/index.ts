@@ -3,7 +3,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import firebasePlugin from './plugins/firebase';
-import { authenticate } from './middleware/auth';
+import importRoute from './routes/import';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -40,14 +40,7 @@ async function main() {
   // platforms and for manual smoke testing.
   app.get('/health', async () => ({ status: 'ok' }));
 
-  // Temporary protected route so we can verify the auth middleware end-to-end
-  // without a real import pipeline yet. Remove once U2 ships its first
-  // protected route.
-  app.get(
-    '/_protected/ping',
-    { preHandler: authenticate },
-    async (request) => ({ uid: request.user?.uid, email: request.user?.email }),
-  );
+  await app.register(importRoute);
 
   try {
     await app.listen({ port: PORT, host: HOST });
