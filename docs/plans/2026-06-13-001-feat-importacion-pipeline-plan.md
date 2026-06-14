@@ -12,6 +12,8 @@ origin: docs/brainstorms/2026-06-13-importacion-contexto-ia-requirements.md
 
 API Fastify/TypeScript que acepta un ZIP de exportacion de Claude o ChatGPT, detecta el proveedor automaticamente, parsea las conversaciones, las envia en batches a MiniMax M3 para extraer senales de contexto estructuradas, y persiste historial crudo + perfil sintetizado en Firestore. Firebase Auth (email/password + Google) maneja la identidad del usuario. Incluye controles de privacidad (delete granular por proveedor, revocacion de acceso por sitio como stub).
 
+**Business model:** B2C users importan gratis — su data es el producto (perfil de contexto agregado que alimenta la red). B2B customers son los que pagan (Track 3, deferred). El cost model del Appendix modela **cost-to-serve por import** (cuanto nos cuesta procesar la data de un usuario B2C), no pricing de B2C. El cost preview en U2 fase 1 es para que el usuario B2C vea cuanto cuesta su import antes de confirmar, sin que eso implique un cobro.
+
 ---
 
 ## Problem Frame
@@ -213,21 +215,76 @@ interface ExtractionResult {
 
 **Approach:** `POST /api/v1/import/upload` acepta `multipart/form-data` con campo `file` (ZIP) y campo opcional `confirmed` (boolean string). Limite de 50MB. Unzip en memoria con `unzipper`; buscar `conversations.json` dentro del ZIP. Parsear el JSON y leer el primer objeto: si tiene clave `mapping` → `chatgpt`; si tiene `chat_messages` → `claude`; sino → 400 `unknown_provider`.
 
-**Fase 1** (`confirmed` ausente o `"false"`): retornar `{ provider, conversationCount, confirmed: false }` — el cliente muestra el disclaimer de MiniMax y re-envia con `confirmed: "true"`.
+**Fase 1** (`confirmed` ausente o `"false"`): retornar un objeto de pre-flight con costo estimado. La estructura es multi-provider-ready aunque hoy U2 acepte un solo archivo:
 
-**Fase 2** (`confirmed: "true"`): delegar a parser (U3 o U4), extraction (U5) y persistencia (U6). Retornar `{ importId, conversationCount, provider }`.
+```json
+{
+  "providers": [
+    { "provider": "claude", "conversationCount": 208, "estimatedTokens": 475000, "estimatedCostUsd": "0.17-0.36" }
+  ],
+  "total": {
+    "providers": 1,
+    "conversationCount": 208,
+    "estimatedTokens": 475000,
+    "estimatedCostUsd": "0.17-0.36"
+  },
+  "confirmed": false
+}
+```
+
+Los `estimatedCostUsd` salen del modelo de costos del Appendix (4 chars/token, $0.30-0.70/M input). **Es cost-to-serve, no un cobro al usuario B2C** — el cliente muestra el disclaimer de MiniMax + el costo estimado como transparencia ("este import le costara a ContextLayer ~$0.50 procesar") y re-envia con `confirmed: "true"`. El label del campo en la respuesta debe dejar esto explicito en el cliente. **Multi-file upload (varios `files: [...]` en una sola request) se agrega en U2.1.**
+
+**Fase 2** (`confirmed: "true"`): delegar a parser (U3 o U4), extraction (U5) y persistencia (U6). Retornar la misma forma multi-file que fase 1, con `confirmed: true` y `importId` + `extraction` por provider en `providers[]`:
+
+```json
+{
+  "providers": [
+    { "provider": "claude", "conversationCount": 208, "estimatedTokens": 475000, "estimatedCostUsd": "0.14-0.33", "importId": "imp_<ts>_<uid6>_claude", "extraction": { "preferences": [...], "personalFacts": [...], "activeIntentions": [...], "domainsOfInterest": [...] } }
+  ],
+  "total": { "providers": 1, "conversationCount": 208, "estimatedTokens": 475000, "estimatedCostUsd": "0.14-0.33" },
+  "confirmed": true
+}
+```
 
 **Test scenarios:**
-- ZIP de Claude con `confirmed: false` retorna `{ provider: "claude", confirmed: false }`
-- ZIP de ChatGPT con `confirmed: false` retorna `{ provider: "chatgpt", confirmed: false }`
+- ZIP de Claude con `confirmed: false` retorna `providers: [{ provider: "claude", conversationCount, estimatedTokens, estimatedCostUsd }]`, `total.providers: 1`, `confirmed: false`
+- ZIP de ChatGPT con `confirmed: false` retorna `providers: [{ provider: "chatgpt", ... }]`
 - ZIP con estructura no reconocida retorna 400 con `error: "unknown_provider"`
 - ZIP corrupto (no es ZIP valido) retorna 400 con mensaje claro
 - Campo `file` no es un archivo ZIP (ej: texto plano) retorna 400
 - Archivo mayor a 50MB retorna 413
 - `confirmed: "true"` con proveedor no reconocido retorna 400 (no procesa)
 - ZIP valido sin `conversations.json` dentro retorna 400 con `error: "missing_conversations_file"`
+- Cost estimate en fase 1 esta dentro de ±20% del modelo del Appendix para una importacion conocida del fundador (208 convos Claude = 475K tokens)
 
-**Verification:** Upload del ZIP de Claude del fundador en fase 1 retorna `provider: "claude"` con el conteo de conversaciones.
+**Verification:** Upload del ZIP de Claude del fundador en fase 1 retorna `provider: "claude"` con el conteo de conversaciones + un `estimatedCostUsd` dentro del rango esperado.
+
+---
+
+### U2.1. Multi-file upload + cost preview agregado
+
+**Goal:** Permitir que el usuario suba uno o varios ZIPs (uno por proveedor) en una sola request, y retornar el costo estimado agregado para que vea el total antes de confirmar.
+
+**Requirements:** R7 (transparencia de costo en el disclaimer), R3 (deteccion por ZIP), R4 (manejo de errores por archivo).
+
+**Dependencies:** U2 (la fase 1 y 2 single-file ya funcionan).
+
+**Files:**
+- `src/routes/import.ts`
+- `src/parsers/detect.ts` (sin cambios funcionales; cada ZIP se detecta independientemente)
+
+**Approach:** extender el handler multipart para aceptar un campo `files` (array) ademas del `file` legacy. Cada archivo se procesa independientemente: unzip, detectar proveedor, parsear `conversations.json`, contar conversaciones. La respuesta de fase 1 agrega los resultados en un unico objeto `providers[]` con un `total` sumado. La fase 2 procesa cada archivo secuencialmente (un batch de LLM calls por archivo, todos en la misma request). Limite agregado: 50MB total entre todos los archivos.
+
+Trade-off explicito: alternativa era single-file-only con cost preview parcial (cliente agrega los costos entre requests). Multi-file es la opcion correcta para el producto — el usuario que importa Claude + ChatGPT + Gemini no deberia tener que aceptar 3 disclaimers separados.
+
+**Test scenarios:**
+- Request con `files: [claude.zip, chatgpt.zip]` en fase 1 retorna `providers: [{provider: "claude", ...}, {provider: "chatgpt", ...}]`, `total.providers: 2`, `total.estimatedCostUsd` = suma de los dos
+- Request con un solo archivo usando el campo `files: [claude.zip]` retorna la misma forma que el `file` legacy (back-compat)
+- Request con 3 archivos donde uno es corrupto retorna 400 con detalle de cual archivo fallo; los archivos validos se reportan en `providers[]` con sus conteos parciales
+- Suma de tamaños de archivos > 50MB retorna 413 antes de parsear
+- Fase 2 con 2 archivos ejecuta el LLM extraction por cada uno y persiste conversaciones de ambos bajo el mismo uid
+
+**Verification:** Subir el ZIP del fundador (Claude) y un export sintetico de ChatGPT en una sola request retorna el `total.estimatedCostUsd` agregado y, tras `confirmed: true`, las conversaciones de ambos proveedores aparecen en `GET /conversations?provider=claude` y `?provider=chatgpt`.
 
 ---
 
@@ -300,16 +357,21 @@ function linearize(conv):
 
 ### U5. Pipeline de extraccion MiniMax M3
 
-**Goal:** Enviar batches de conversaciones a MiniMax M3 y retornar senales de contexto estructuradas con atribucion de proveedor.
+**Goal:** Enviar batches de conversaciones a MiniMax M3 y retornar senales de contexto estructuradas con atribucion de proveedor. Multi-provider por default: la primera importacion realista de un usuario (2-3 proveedores) corre aqui y cuesta ~$0.20-1.00 (ver Appendix: U5 cost model).
 
 **Requirements:** R5, R6.
 
-**Dependencies:** U3 o U4.
+**Dependencies:** U3 o U4 (dado un array de `ConversationRecord` ya parseado). U6 provee el cliente de Firestore para el dedup pre-LLM.
 
 **Files:**
 - `src/extraction/minimax.ts`
+- `src/extraction/cost-telemetry.ts` (logging estructurado de tokens por call)
 
-**Approach:** Inicializar `OpenAI` con `baseURL: process.env.MINIMAX_BASE_URL ?? "https://api.minimax.io/v1"` y `apiKey: process.env.MINIMAX_API_KEY`. Aceptar array de `ConversationRecord` y el string `provider`. Dividir en batches de `MINIMAX_BATCH_SIZE` (default 20, configurable via env). Por cada batch, construir un user prompt con el texto de todas las conversaciones separadas por `---` y pedir JSON con el schema de `ExtractionResult`. Parsear la respuesta; si el JSON es invalido, loggear y continuar con arrays vacios para ese batch. Mergear todos los resultados. Setear `provider` y `source` (titulo de la conversacion) en cada signal.
+**Approach:** Inicializar `OpenAI` con `baseURL: process.env.MINIMAX_BASE_URL ?? "https://api.minimax.io/v1"` y `apiKey: process.env.MINIMAX_API_KEY`. Aceptar array de `ConversationRecord` y el string `provider`. **Antes del LLM call**: hacer un dedup query a `users/{uid}/conversations` para obtener los `providerId` ya importados bajo este `provider`; filtrar el array de entrada a solo conversaciones nuevas. Esto evita pagar el LLM call dos veces si el usuario re-importa el mismo dataset (escenario comun al re-ejecutar el pipeline). Dividir el array resultante en batches de `MINIMAX_BATCH_SIZE` (default 20, configurable via env; override per-provider via `MINIMAX_BATCH_SIZE_CLAUDE` / `MINIMAX_BATCH_SIZE_CHATGPT` para usuarios con sizes desiguales entre proveedores). Por cada batch, construir un user prompt con el texto de todas las conversaciones separadas por `---` y pedir JSON con el schema de `ExtractionResult`. Parsear la respuesta; si el JSON es invalido, loggear y continuar con arrays vacios para ese batch. Mergear todos los resultados. Setear `provider` y `source` (titulo de la conversacion) en cada signal.
+
+**Cost telemetry:** por cada call a MiniMax, loggear `provider`, `batchSize`, `inputTokens`, `outputTokens`, `latencyMs` con un logger estructurado (JSON a stdout en dev, `firebase-admin` log sink en prod). El primer checkpoint de calibracion es re-correr los Scenarios 1-3 del Appendix con los numeros reales despues de la primera importacion del fundador.
+
+**Modelo de costo (referencia rapida):** 4 chars/token, $0.30-0.70/M input, output ~3-5x input. Ver Appendix para los 5 escenarios. La optimizacion por escenario (dedup, batch size, cascade summarization para outliers 4-5) se hace en iteraciones post-launch gated on telemetry real.
 
 **Technical design — prompt (directional):**
 ```
@@ -341,8 +403,13 @@ User:
 - Cada signal en el resultado tiene `provider` igual al proveedor de entrada
 - Cada signal tiene `source` que coincide con el `title` de alguna conversacion del batch
 - Fallo de red a MiniMax lanza error que se propaga al endpoint (no se silencia)
+- **Dedup pre-LLM:** re-importar el mismo dataset (mismo `(provider, providerId)`) no dispara nuevas llamadas a MiniMax — el log muestra 0 batches enviados
+- **Dedup parcial:** re-importar 50 conversaciones de un dataset de 100 donde 50 ya estaban importadas dispara LLM calls solo para las 50 nuevas
+- **Cost telemetry:** cada call exitoso a MiniMax emite un log estructurado con `provider`, `batchSize`, `inputTokens`, `outputTokens` (verificable con un test que captura stdout / spy sobre el logger)
+- **Per-provider batch size:** si `MINIMAX_BATCH_SIZE_CHATGPT=10` esta seteado y el input tiene 25 conversaciones de chatgpt, se generan 3 batches (10+10+5), no 2
+- **Multi-provider run:** una invocacion secuencial sobre 3 arrays (uno por provider) emite logs separados por provider, no se mezclan signals entre providers
 
-**Verification:** Import de las conversaciones del fundador produce `ExtractionResult` con al menos 3 signals en algun campo; loggear tokens usados por call para calibrar costo.
+**Verification:** Import de las conversaciones del fundador produce `ExtractionResult` con al menos 3 signals en algun campo; loggear tokens usados por call para calibrar costo. Comparar el `inputTokens` real contra el `estimatedTokens` de U2 (fase 1) — desviaciones >30% senalan que la heuristica 4 chars/token necesita recalibracion.
 
 ---
 
@@ -480,8 +547,61 @@ Todos los deletes responden `{ deleted: true }`. Operaciones sobre datos inexist
 **Deferred to implementation**
 
 - Si el `sk-cp-` key funciona contra `api.minimax.io` directamente o requiere el base URL del proxy — testear en U5 antes de hardcodear.
-- Batch size optimo para MiniMax: 20 conversaciones es el punto de partida; ajustar segun uso de tokens observado en las primeras llamadas.
+- Batch size optimo para MiniMax: 20 conversaciones es el punto de partida; ajustar segun uso de tokens observado en las primeras llamadas. Override per-provider (`MINIMAX_BATCH_SIZE_CLAUDE`, `MINIMAX_BATCH_SIZE_CHATGPT`) ya planeado en U5 para usuarios con sizes desiguales.
 - Indices compuestos de Firestore para queries `provider + date` — Firestore los solicita al primer query miss; crear en consola Firebase.
+- **Output token pricing con MiniMax** — el modelo del Appendix asume ~3-5x input; confirmar con MiniMax antes de shippear el cost preview al usuario. Si output es 5x input (no 3x), los Scenarios 3-5 se desplazan visiblemente.
+- **U2.1 secuencia** — multi-file upload debe estar listo antes de que U5 entre en produccion (U5 corre por archivo dentro de la misma request). Si U5 sale primero, el primer import multi-provider del fundador requiere sequential POSTs.
+
+---
+
+## Appendix: U5 cost model
+
+Modelo de costo para U5 (extraccion MiniMax M3) en 5 arquetipos de usuario. Baseline multi-provider (2-3 proveedores como caso tipico, no 1). Numeros son rangos, no promesas — recalibrar con la primera importacion real del fundador antes de cerrar el modelo. Doc de research: `docs/plans/2026-06-13-002-feat-u5-cost-model-plan.md`.
+
+### Pricing assumptions
+
+- **Input:** $0.30-0.70 por 1M tokens (rango del plan, calibrar tras la primera llamada real)
+- **Output:** ~$1.50 por 1M tokens (3-5x input; **necesita verificacion con MiniMax**, ver Open Question)
+- **Modelo:** `MiniMax-M3`, 1M token context window, baseURL `https://api.minimax.io/v1`
+
+### Token estimation
+
+- **Char-to-token ratio:** ~4 chars/token (heuristica para English text; vale para Claude export style)
+- **System prompt + schema per batch:** ~800 tokens de overhead fijo
+- **Output per batch:** ~500-2000 tokens dependiendo de la densidad de senales
+- **Batch size:** 20 conversaciones default (`MINIMAX_BATCH_SIZE`)
+- **Avg conversation size:** 9KB rawText (calibrado del export del fundador: 208 conversaciones → 1.9MB / 208 = 9KB)
+
+### Sanity check (founder's data, Claude only)
+
+208 conversaciones × 9KB ≈ 1.9MB rawText ≈ 475K tokens. Cabe en una sola llamada de 1M contexto. El default de 20/batch da 11 llamadas; el contexto de 1M hace que 1 llamada sea tecnicamente posible. El batch default es una perilla de control de costo, no un limite duro.
+
+**Nota:** la primera importacion real del fundador sera 3 proveedores (Claude + ChatGPT + Gemini), no 1. Costo aproximadamente 3x de este baseline. Scenario 3 abajo refleja el end state real.
+
+### Scenarios (per single import session, todos los providers que el usuario quiere importar en una sola vez)
+
+| # | Archetype | Convos (per provider → total) | Providers | RawText | Tokens (in) | Batches | Input cost | Output cost | **Total** |
+|---|-----------|-------------------------------|-----------|---------|-------------|---------|------------|-------------|-----------|
+| 1 | Light (empezo con un AI, agrego un segundo recientemente) | 30+50 = 80 | 2 | 0.7 MB | ~180K | 4 | $0.05-0.13 | ~$0.01 | **$0.07-0.14** |
+| 2 | Typical (2 providers, uso casual-a-moderate durante 1-2 anos) | 100+150 = 250 | 2 | 2.3 MB | ~570K | 13 | $0.17-0.40 | ~$0.03 | **$0.20-0.43** |
+| 3 | Founder baseline (3 providers, multi-year — Claude + ChatGPT + Gemini) | 200+200+200 = 600 | 3 | 5.4 MB | ~1.35M | 30 | $0.41-0.95 | ~$0.07 | **$0.47-1.01** |
+| 4 | Power user (3 providers, heavy multi-year use) | 500+800+300 = 1,600 | 3 | 14.4 MB | ~3.6M | 80 | $1.08-2.52 | ~$0.18 | **$1.26-2.70** |
+| 5 | Hoarder (3+ providers, decade+ of usage) | 2K+3K+1K = 6,000 | 3+ | 54 MB | ~13.5M | 300 | $4.05-9.45 | ~$0.68 | **$4.73-10.13** |
+
+### Key observations
+
+- **Sub-dollar para 60% de los usuarios (Scenarios 1-2).** El founder baseline (Scenario 3) cubre $0.47-1.01 — cruza el umbral de $1, con el upper bound driven por el peor caso de input pricing ($0.70/M).
+- **Multi-provider baseline shifts the curve.** Primera version del modelo asumia single-provider; eso ponia 90% de los usuarios bajo $2. El baseline realista 2-3-provider pone ~40% sobre $1.
+- **Provider adds son lineales, no sinergicos.** Cada provider es su propio U5 pass; no hay trabajo compartido, no hay costo amortizado entre providers. Un intake de 3 providers ≈ 3x el costo per-provider.
+- **Scenarios 4-5 cruzan umbrales significativos.** Power users ($1.27-2.70) y hoarders ($4.73-10.13) son eventos de costo real. Decidir antes de launch si los absorbemos, medimos o capeamos.
+
+### Optimization levers (priority order; 1 y 5 aterrizan con U5, 2-4 son post-launch)
+
+1. **Dedup on `(provider, providerId)` pre-LLM call** — U5 ya lo implementa. Re-import no es un cost event.
+2. **Aumentar batch size para power users** — 1M context significa 50-100 convos/batch es tecnicamente viable. Mitad del overhead-driven cost para Scenario 3+. Post-launch gated on telemetry.
+3. **Cascade para outliers** — Scenario 4-5 users (1.5K+ convos) reciben two-pass run: first pass resume a 10% size, second pass extrae de summaries. Costo ~30-50% de single-pass. Trades signal precision for cost. Post-launch.
+4. **Pre-filter a "interesting" conversations** — heuristica: skip convos <500 chars, skip all-tool-use assistant responses. Quita ~20-30% del volumen de tokens a zero quality cost. Post-launch.
+5. **Per-provider batch sizing** — U5 ya lo soporta (`MINIMAX_BATCH_SIZE_CLAUDE`, `MINIMAX_BATCH_SIZE_CHATGPT`). Small providers get smaller batches (less overhead); big providers get bigger batches (more amortization).
 
 ---
 
