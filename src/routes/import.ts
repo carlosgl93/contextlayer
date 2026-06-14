@@ -7,9 +7,12 @@ import { parseChatGPTConversations } from '../parsers/chatgpt';
 import { authenticate } from '../middleware/auth';
 import {
   extractContextSignals,
+  defaultClient,
   type DedupProvider,
   type OpenAIClient,
 } from '../extraction/minimax';
+import { writeConversations } from '../firestore/conversations';
+import { mergeProfile } from '../firestore/profile';
 import type { ConversationRecord, ExtractionResult, Provider } from '../types';
 
 /**
@@ -344,13 +347,9 @@ const importRoute: FastifyPluginAsync = async (app: FastifyInstance) => {
       const injectedClient = (app as unknown as { minimaxClient?: OpenAIClient }).minimaxClient;
       const client =
         injectedClient ??
-        (process.env.MINIMAX_API_KEY
-          ? new (require('openai').default)({
-              apiKey: process.env.MINIMAX_API_KEY,
-              baseURL: process.env.MINIMAX_BASE_URL ?? 'https://api.minimax.io/v1',
-            })
-          : noOpOpenAIClient());
+        (process.env.MINIMAX_API_KEY ? defaultClient() : noOpOpenAIClient());
       const dedup = app.minimaxDedupProvider ?? firestoreDedupProvider(app, uid);
+      const db = app.firebaseAdmin.firestore();
       const importRows: ProviderRow[] = [];
 
       for (let i = 0; i < inspections.length; i++) {
@@ -390,6 +389,26 @@ const importRoute: FastifyPluginAsync = async (app: FastifyInstance) => {
           );
           return reply.code(500).send({
             error: 'extraction_failed',
+            provider,
+            confirmed: true,
+          } as ImportUploadResponse);
+        }
+
+        // U6 — persist raw conversations and merge the extracted signals
+        // into the user profile. Any persistence failure aborts this
+        // provider with a 500; previously imported providers in this
+        // request are still in the database (each provider commits
+        // independently) but the response only reflects the failure.
+        try {
+          await writeConversations(db, uid, records);
+          await mergeProfile(db, uid, extraction);
+        } catch (err) {
+          request.log.error(
+            { uid, provider, err },
+            'persistence failed',
+          );
+          return reply.code(500).send({
+            error: 'persistence_failed',
             provider,
             confirmed: true,
           } as ImportUploadResponse);

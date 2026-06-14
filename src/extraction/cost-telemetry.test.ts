@@ -8,13 +8,18 @@ import {
 } from './cost-telemetry';
 
 // Capture sink: stores every event for assertion.
-function makeCaptureSink(): { sink: CostSink; events: Array<Record<string, unknown>> } {
-  const events: Array<Record<string, unknown>> = [];
+function makeCaptureSink(): {
+  sink: CostSink;
+  events: Array<{ timestamp: string; [k: string]: unknown }>;
+} {
+  const events: Array<{ timestamp: string; [k: string]: unknown }> = [];
   return {
     events,
     sink: {
       write(event) {
-        events.push(event);
+        // Spread into a plain dict so downstream assertions can index
+        // dynamically without TS complaining about index signatures.
+        events.push({ ...event });
       },
     },
   };

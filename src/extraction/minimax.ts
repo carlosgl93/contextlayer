@@ -137,7 +137,7 @@ function mergeResult(into: ExtractionResult, from: ExtractionResult): void {
   into.domainsOfInterest.push(...from.domainsOfInterest);
 }
 
-function defaultClient(): OpenAIClient {
+export function defaultClient(): OpenAIClient {
   return new OpenAI({
     apiKey: process.env.MINIMAX_API_KEY,
     baseURL: process.env.MINIMAX_BASE_URL ?? 'https://api.minimax.io/v1',

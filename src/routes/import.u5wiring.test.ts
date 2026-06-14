@@ -70,6 +70,9 @@ async function buildTestAppWithDeps(deps: {
   await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } });
   const fakeAdmin = {
     auth: () => ({ verifyIdToken: async () => ({ uid: 'test-uid' }) }),
+    // U6 stub: in-memory firestore. Tests that need to assert writes
+    // re-decorate `firebaseAdmin` with their own fake.
+    firestore: () => makeFakeFirestore(),
   };
   app.decorate('firebaseAdmin', fakeAdmin as unknown as never);
   if (deps.client) app.decorate('minimaxClient', deps.client);
@@ -239,3 +242,44 @@ test('U5 wiring: phase 1 with no `confirmed` field never invokes the extractor',
   rmSync(zipPath, { force: true });
   await app.close();
 });
+
+/**
+ * Minimal in-memory Firestore fake. Path-aware chaining so
+ * users/{uid}/conversations/{id} resolves to a single key.
+ */
+function makeFakeFirestore() {
+  const docs = new Map<string, Record<string, unknown>>();
+  const makeDoc = (path: string) => ({
+    path,
+    collection: (colPath: string) => ({
+      doc: (id: string) => makeDoc(`${path}/${colPath}/${id}`),
+    }),
+    async get() {
+      const data = docs.get(path);
+      return { exists: data !== undefined, data: () => data };
+    },
+    async set(data: Record<string, unknown>) {
+      docs.set(path, { ...(docs.get(path) ?? {}), ...data });
+    },
+  });
+  return {
+    docs,
+    collection: (p: string) => ({ doc: (id: string) => makeDoc(`${p}/${id}`) }),
+    doc: (p: string) => makeDoc(p),
+    batch: () => {
+      const sets: Array<{ ref: ReturnType<typeof makeDoc>; data: Record<string, unknown> }> = [];
+      const b = {
+        set(ref: ReturnType<typeof makeDoc>, data: Record<string, unknown>) {
+          sets.push({ ref, data });
+          return b;
+        },
+        async commit() {
+          for (const { ref, data } of sets) {
+            docs.set(ref.path, { ...(docs.get(ref.path) ?? {}), ...data });
+          }
+        },
+      };
+      return b;
+    },
+  };
+}

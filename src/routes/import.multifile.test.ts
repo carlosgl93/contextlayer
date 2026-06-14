@@ -38,6 +38,9 @@ async function buildTestApp(): Promise<FastifyInstance> {
   await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } });
   const fakeAdmin = {
     auth: () => ({ verifyIdToken: async () => ({ uid: 'x' }) }),
+    // U6 stub: an in-memory firestore. These tests don't assert writes
+    // directly, but the route's phase 2 now calls it.
+    firestore: () => makeFakeFirestore(),
   };
   app.decorate('firebaseAdmin', fakeAdmin as unknown as never);
   // U5 phase-2 stub: a no-op LLM client that returns an empty result.
@@ -86,6 +89,25 @@ function makeZip(path: string, body: object | unknown[]): void {
 function makeCorruptZip(path: string): void {
   // Not a valid zip — just write arbitrary bytes
   writeFileSync(path, Buffer.from('this is not a zip file', 'utf-8'));
+}
+
+// Build a valid zip whose only entry is NOT `conversations.json`. Used to
+// exercise the `missing_conversations_file` 400 path (U2 test scenario).
+function makeZipWithoutConversations(path: string): void {
+  const dir = join(
+    tmpdir(),
+    `cgl-mf-empty-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'README.md'), 'not the conversations file');
+  const result = spawnSync('zip', ['-q', path, 'README.md'], {
+    cwd: dir,
+    encoding: 'utf-8',
+  });
+  if (result.status !== 0) {
+    throw new Error(`zip failed: ${result.stderr}`);
+  }
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // Build a multipart payload with the legacy single-file `file` field.
@@ -337,3 +359,67 @@ test('U2.1: phase 2 with 2 files dispatches parsers and reports per-provider imp
   rmSync(chatgptPath, { force: true });
   await app.close();
 });
+
+test('U2: valid zip without conversations.json returns 400 missing_conversations_file', async () => {
+  const app = await buildTestApp();
+  const zipPath = join(tmpdir(), `cgl-mf-noconv-${Date.now()}.zip`);
+  makeZipWithoutConversations(zipPath);
+  const mp = buildSingleFileMultipart(zipPath);
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/v1/import/upload',
+    headers: { ...mp.headers, authorization: 'Bearer dev:tester:tester@x.com' },
+    payload: mp.payload,
+  });
+  assert.equal(res.statusCode, 400);
+  const body = res.json();
+  // Single-file missing_conversations_file surfaces directly as body.error
+  // for U2-era clients checking that exact string.
+  assert.equal(body.error, 'missing_conversations_file');
+  assert.equal(body.confirmed, false);
+  rmSync(zipPath, { force: true });
+  await app.close();
+});
+
+/**
+ * Minimal in-memory Firestore fake. Mirrors only the surface the import
+ * route touches: collection().doc(), doc.set(), and batch().set().commit().
+ * Path-aware chaining so users/{uid}/conversations/{id} resolves to a
+ * single key.
+ */
+function makeFakeFirestore() {
+  const docs = new Map<string, Record<string, unknown>>();
+  const makeDoc = (path: string) => ({
+    path,
+    collection: (colPath: string) => ({
+      doc: (id: string) => makeDoc(`${path}/${colPath}/${id}`),
+    }),
+    async get() {
+      const data = docs.get(path);
+      return { exists: data !== undefined, data: () => data };
+    },
+    async set(data: Record<string, unknown>) {
+      docs.set(path, { ...(docs.get(path) ?? {}), ...data });
+    },
+  });
+  return {
+    docs,
+    collection: (p: string) => ({ doc: (id: string) => makeDoc(`${p}/${id}`) }),
+    doc: (p: string) => makeDoc(p),
+    batch: () => {
+      const sets: Array<{ ref: ReturnType<typeof makeDoc>; data: Record<string, unknown> }> = [];
+      const b = {
+        set(ref: ReturnType<typeof makeDoc>, data: Record<string, unknown>) {
+          sets.push({ ref, data });
+          return b;
+        },
+        async commit() {
+          for (const { ref, data } of sets) {
+            docs.set(ref.path, { ...(docs.get(ref.path) ?? {}), ...data });
+          }
+        },
+      };
+      return b;
+    },
+  };
+}

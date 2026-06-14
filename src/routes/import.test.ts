@@ -15,8 +15,12 @@ async function buildTestApp(): Promise<FastifyInstance> {
   process.env.CGL_DEV_AUTH_BYPASS = '1';
   const app = Fastify();
   await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } });
+  const sharedDb = makeFakeFirestore();
   const fakeAdmin = {
     auth: () => ({ verifyIdToken: async () => ({ uid: 'x' }) }),
+    // U6 stub: same in-memory firestore instance returned every call so
+    // the route's writes and the test's assertions see the same data.
+    firestore: () => sharedDb,
   };
   app.decorate('firebaseAdmin', fakeAdmin as unknown as never);
   // U5 phase-2 stub: a no-op LLM client that returns an empty result.
@@ -206,6 +210,137 @@ test('POST /api/v1/import/upload with confirmed=true returns per-provider import
   assert.equal(body.providers.length, 1);
   assert.equal(body.providers[0].provider, 'claude');
   assert.match(body.providers[0].importId, /^imp_/);
+  rmSync(zipPath, { force: true });
+  await app.close();
+});
+
+/**
+ * Minimal in-memory Firestore fake scoped to the import route tests.
+ * Captures every doc write by path so persistence tests can assert that
+ * phase 2 actually committed the parsed conversations and the merged
+ * profile under the authenticated uid.
+ */
+function makeFakeFirestore() {
+  const docs = new Map<string, Record<string, unknown>>();
+  const writes: Array<{ path: string; data: Record<string, unknown> }> = [];
+  const makeDoc = (path: string) => ({
+    path,
+    collection: (colPath: string) => ({
+      doc: (id: string) => makeDoc(`${path}/${colPath}/${id}`),
+    }),
+    async get() {
+      const data = docs.get(path);
+      return { exists: data !== undefined, data: () => data };
+    },
+    async set(data: Record<string, unknown>) {
+      docs.set(path, { ...(docs.get(path) ?? {}), ...data });
+      writes.push({ path, data });
+    },
+  });
+  return {
+    docs,
+    writes,
+    collection: (p: string) => ({ doc: (id: string) => makeDoc(`${p}/${id}`) }),
+    doc: (p: string) => makeDoc(p),
+    batch: () => {
+      const sets: Array<{ ref: ReturnType<typeof makeDoc>; data: Record<string, unknown> }> = [];
+      const b = {
+        set(ref: ReturnType<typeof makeDoc>, data: Record<string, unknown>) {
+          sets.push({ ref, data });
+          return b;
+        },
+        async commit() {
+          for (const { ref, data } of sets) {
+            docs.set(ref.path, { ...(docs.get(ref.path) ?? {}), ...data });
+            writes.push({ path: ref.path, data });
+          }
+        },
+      };
+      return b;
+    },
+  };
+}
+
+test('POST /api/v1/import/upload phase 2 persists conversations to users/{uid}/conversations', async () => {
+  const app = await buildTestApp();
+  const zipPath = join(tmpdir(), `cgl-persist-${Date.now()}.zip`);
+  makeZip(zipPath, [
+    { uuid: 'a', chat_messages: [{ sender: 'human', text: 'hi' }] },
+  ]);
+  const mp = buildMultipart(zipPath, { confirmed: 'true' });
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/v1/import/upload',
+    headers: {
+      ...mp.headers,
+      authorization: 'Bearer dev:tester:tester@x.com',
+    },
+    payload: mp.payload,
+  });
+  assert.equal(res.statusCode, 202);
+  const fakeDb = (app.firebaseAdmin as unknown as { firestore: () => ReturnType<typeof makeFakeFirestore> }).firestore();
+  const convPath = 'users/tester/conversations/claude_a';
+  assert.ok(fakeDb.docs.has(convPath), `expected ${convPath} to be written`);
+  const written = fakeDb.docs.get(convPath) as { provider: string; providerId: string; rawText: string };
+  assert.equal(written.provider, 'claude');
+  assert.equal(written.providerId, 'a');
+  assert.match(written.rawText, /user: hi/);
+  rmSync(zipPath, { force: true });
+  await app.close();
+});
+
+test('POST /api/v1/import/upload phase 2 persists merged profile to users/{uid}/profile/main', async () => {
+  // Override the LLM stub to return a non-empty extraction so the
+  // profile writer has something to merge.
+  const app = await buildTestApp();
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  preferences: [{ value: 'electric cars', source: 'Test conv' }],
+                  personalFacts: [],
+                  activeIntentions: [],
+                  domainsOfInterest: [],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 0, completion_tokens: 0 },
+        }),
+      },
+    },
+  };
+  (app as unknown as { minimaxClient: unknown }).minimaxClient = fakeClient;
+
+  const zipPath = join(tmpdir(), `cgl-prof-${Date.now()}.zip`);
+  makeZip(zipPath, [
+    { uuid: 'a', chat_messages: [{ sender: 'human', text: 'I want an electric car' }] },
+  ]);
+  const mp = buildMultipart(zipPath, { confirmed: 'true' });
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/v1/import/upload',
+    headers: {
+      ...mp.headers,
+      authorization: 'Bearer dev:tester:tester@x.com',
+    },
+    payload: mp.payload,
+  });
+  assert.equal(res.statusCode, 202);
+  const fakeDb = (app.firebaseAdmin as unknown as { firestore: () => ReturnType<typeof makeFakeFirestore> }).firestore();
+  const profilePath = 'users/tester/profile/main';
+  assert.ok(fakeDb.docs.has(profilePath), `expected ${profilePath} to be written`);
+  const written = fakeDb.docs.get(profilePath) as {
+    preferences: Array<{ value: string; provider: string }>;
+    updatedAt: unknown;
+  };
+  assert.equal(written.preferences.length, 1);
+  assert.equal(written.preferences[0]!.value, 'electric cars');
+  assert.equal(written.preferences[0]!.provider, 'claude');
   rmSync(zipPath, { force: true });
   await app.close();
 });
