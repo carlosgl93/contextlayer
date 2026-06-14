@@ -88,9 +88,12 @@ test('POST /api/v1/import/upload returns 202 + provider=claude for Claude ZIP', 
   });
   assert.equal(res.statusCode, 202);
   const body = res.json();
-  assert.equal(body.provider, 'claude');
-  assert.equal(body.conversationCount, 2);
   assert.equal(body.confirmed, false);
+  assert.equal(body.providers.length, 1);
+  assert.equal(body.providers[0].provider, 'claude');
+  assert.equal(body.providers[0].conversationCount, 2);
+  assert.equal(body.total.conversationCount, 2);
+  assert.equal(body.total.providers, 1);
   rmSync(zipPath, { force: true });
   await app.close();
 });
@@ -113,9 +116,10 @@ test('POST /api/v1/import/upload returns 202 + provider=chatgpt for ChatGPT ZIP'
   });
   assert.equal(res.statusCode, 202);
   const body = res.json();
-  assert.equal(body.provider, 'chatgpt');
-  assert.equal(body.conversationCount, 1);
   assert.equal(body.confirmed, false);
+  assert.equal(body.providers.length, 1);
+  assert.equal(body.providers[0].provider, 'chatgpt');
+  assert.equal(body.providers[0].conversationCount, 1);
   rmSync(zipPath, { force: true });
   await app.close();
 });
@@ -156,7 +160,7 @@ test('POST /api/v1/import/upload returns 401 without auth', async () => {
   await app.close();
 });
 
-test('POST /api/v1/import/upload with confirmed=true returns importId', async () => {
+test('POST /api/v1/import/upload with confirmed=true returns per-provider importId', async () => {
   const app = await buildTestApp();
   const zipPath = join(tmpdir(), `cgl-confirmed-${Date.now()}.zip`);
   makeZip(zipPath, [
@@ -175,8 +179,9 @@ test('POST /api/v1/import/upload with confirmed=true returns importId', async ()
   assert.equal(res.statusCode, 202);
   const body = res.json();
   assert.equal(body.confirmed, true);
-  assert.equal(body.provider, 'claude');
-  assert.match(body.importId, /^imp_/);
+  assert.equal(body.providers.length, 1);
+  assert.equal(body.providers[0].provider, 'claude');
+  assert.match(body.providers[0].importId, /^imp_/);
   rmSync(zipPath, { force: true });
   await app.close();
 });
