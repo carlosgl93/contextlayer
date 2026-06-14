@@ -40,6 +40,30 @@ async function buildTestApp(): Promise<FastifyInstance> {
     auth: () => ({ verifyIdToken: async () => ({ uid: 'x' }) }),
   };
   app.decorate('firebaseAdmin', fakeAdmin as unknown as never);
+  // U5 phase-2 stub: a no-op LLM client that returns an empty result.
+  // Tests that exercise the extractor further override this decorator.
+  const emptyExtraction = JSON.stringify({
+    preferences: [],
+    personalFacts: [],
+    activeIntentions: [],
+    domainsOfInterest: [],
+  });
+  const stubClient = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{ message: { content: emptyExtraction } }],
+          usage: { prompt_tokens: 0, completion_tokens: 0 },
+        }),
+      },
+    },
+  };
+  app.decorate('minimaxClient', stubClient as unknown as never);
+  // U5 dedup stub: no-op provider that reports zero already-imported
+  // records. Tests that exercise dedup override this decoration.
+  app.decorate('minimaxDedupProvider', {
+    getExistingProviderIds: async () => new Set<string>(),
+  } as unknown as never);
   await app.register(importRoute);
   return app;
 }
@@ -300,8 +324,8 @@ test('U2.1: phase 2 with 2 files dispatches parsers and reports per-provider imp
     headers: { ...mp.headers, authorization: 'Bearer dev:tester:tester@x.com' },
     payload: mp.payload,
   });
-  assert.equal(res.statusCode, 202);
   const body = res.json();
+  assert.equal(res.statusCode, 202, `expected 202 got ${res.statusCode}; body=${JSON.stringify(body)}`);
   assert.equal(body.confirmed, true);
   assert.ok(Array.isArray(body.providers));
   assert.equal(body.providers.length, 2);

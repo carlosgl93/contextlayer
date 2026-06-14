@@ -19,6 +19,30 @@ async function buildTestApp(): Promise<FastifyInstance> {
     auth: () => ({ verifyIdToken: async () => ({ uid: 'x' }) }),
   };
   app.decorate('firebaseAdmin', fakeAdmin as unknown as never);
+  // U5 phase-2 stub: a no-op LLM client that returns an empty result.
+  // Individual tests can override by re-decorating before injecting.
+  const emptyExtraction = JSON.stringify({
+    preferences: [],
+    personalFacts: [],
+    activeIntentions: [],
+    domainsOfInterest: [],
+  });
+  const stubClient = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{ message: { content: emptyExtraction } }],
+          usage: { prompt_tokens: 0, completion_tokens: 0 },
+        }),
+      },
+    },
+  };
+  app.decorate('minimaxClient', stubClient as unknown as never);
+  // U5 dedup stub: no-op provider that reports zero already-imported
+  // records. Tests that exercise dedup override this decoration.
+  app.decorate('minimaxDedupProvider', {
+    getExistingProviderIds: async () => new Set<string>(),
+  } as unknown as never);
   await app.register(importRoute);
   return app;
 }

@@ -1,8 +1,16 @@
 import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
+import fp from 'fastify-plugin';
 import unzipper from 'unzipper';
 import { detectProvider } from '../parsers/detect';
+import { parseClaudeConversations } from '../parsers/claude';
+import { parseChatGPTConversations } from '../parsers/chatgpt';
 import { authenticate } from '../middleware/auth';
-import type { Provider } from '../types';
+import {
+  extractContextSignals,
+  type DedupProvider,
+  type OpenAIClient,
+} from '../extraction/minimax';
+import type { ConversationRecord, ExtractionResult, Provider } from '../types';
 
 /**
  * POST /api/v1/import/upload
@@ -59,6 +67,8 @@ export interface ProviderRow {
   estimatedTokens: number;
   estimatedCostUsd: string;
   importId?: string;
+  /** Populated on phase 2 with the merged extraction result per provider. */
+  extraction?: ExtractionResult;
 }
 
 export interface ImportTotal {
@@ -321,14 +331,76 @@ const importRoute: FastifyPluginAsync = async (app: FastifyInstance) => {
         } as ImportUploadResponse);
       }
 
-      // Phase 2 — confirmed. For each valid file, dispatch to U3/U4
-      // parsers. LLM extraction (U5) and Firestore persistence (U6)
-      // are stubbed at this layer; the contract is per-provider
-      // importId + counts so the client can poll for completion.
-      const importRows: ProviderRow[] = okRows.map((row) => ({
-        ...row,
-        importId: `imp_${Date.now()}_${uid.slice(0, 6)}_${row.provider}`,
-      }));
+      // Phase 2 — confirmed. For each valid file: re-parse with U3/U4,
+      // run U5 extraction (dedup + per-provider batching), and emit a
+      // per-provider importId. Firestore persistence (U6) is wired in
+      // here too once that lands; for now extraction is the
+      // server-visible work product.
+      // In production, an injected `minimaxClient` is preferred. When
+      // neither injection nor `MINIMAX_API_KEY` is available, fall back
+      // to a no-op client so the route still returns a stable shape
+      // (signals come back empty). Real LLM calls require a real
+      // client; the no-op is the safe local-dev / test default.
+      const injectedClient = (app as unknown as { minimaxClient?: OpenAIClient }).minimaxClient;
+      const client =
+        injectedClient ??
+        (process.env.MINIMAX_API_KEY
+          ? new (require('openai').default)({
+              apiKey: process.env.MINIMAX_API_KEY,
+              baseURL: process.env.MINIMAX_BASE_URL ?? 'https://api.minimax.io/v1',
+            })
+          : noOpOpenAIClient());
+      const dedup = app.minimaxDedupProvider ?? firestoreDedupProvider(app, uid);
+      const importRows: ProviderRow[] = [];
+
+      for (let i = 0; i < inspections.length; i++) {
+        const inspection = inspections[i];
+        if (inspection.kind !== 'ok') continue;
+        const f = files[i];
+        const provider = inspection.row.provider;
+        let records: ConversationRecord[];
+        try {
+          const { parsed } = await readConversationsJson(f.buffer);
+          records =
+            provider === 'claude'
+              ? parseClaudeConversations(parsed as unknown[])
+              : parseChatGPTConversations(parsed as unknown[]);
+        } catch (err) {
+          request.log.warn({ uid, provider, err }, 'phase 2 parse failed');
+          return reply.code(500).send({
+            error: 'parse_failed',
+            provider,
+            confirmed: true,
+          } as ImportUploadResponse);
+        }
+
+        let extraction: ExtractionResult;
+        try {
+          extraction = await extractContextSignals({
+            uid,
+            provider,
+            conversations: records,
+            openaiClient: client,
+            dedup,
+          });
+        } catch (err) {
+          request.log.error(
+            { uid, provider, err },
+            'extraction failed',
+          );
+          return reply.code(500).send({
+            error: 'extraction_failed',
+            provider,
+            confirmed: true,
+          } as ImportUploadResponse);
+        }
+
+        importRows.push({
+          ...inspection.row,
+          importId: `imp_${Date.now()}_${uid.slice(0, 6)}_${provider}`,
+          extraction,
+        });
+      }
 
       return reply.code(202).send({
         providers: importRows,
@@ -339,4 +411,68 @@ const importRoute: FastifyPluginAsync = async (app: FastifyInstance) => {
   );
 };
 
-export default importRoute;
+function noOpOpenAIClient(): OpenAIClient {
+  return {
+    chat: {
+      completions: {
+        create: (async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  preferences: [],
+                  personalFacts: [],
+                  activeIntentions: [],
+                  domainsOfInterest: [],
+                }),
+              },
+            },
+          ],
+          usage: { prompt_tokens: 0, completion_tokens: 0 },
+        })) as unknown as OpenAIClient['chat']['completions']['create'],
+      },
+    },
+  };
+}
+
+function firestoreDedupProvider(app: FastifyInstance, uid: string): DedupProvider {
+  return {
+    async getExistingProviderIds(provider) {
+      const admin = app.firebaseAdmin;
+      if (!admin) {
+        throw new Error('firebaseAdmin not available on Fastify instance');
+      }
+      const db = admin.firestore();
+      const snap = await db
+        .collection('users')
+        .doc(uid)
+        .collection('conversations')
+        .where('provider', '==', provider)
+        .select('providerId')
+        .get();
+      const ids = new Set<string>();
+      for (const doc of snap.docs) {
+        const d = doc.data() as { providerId?: unknown };
+        if (typeof d.providerId === 'string') ids.add(d.providerId);
+      }
+      return ids;
+    },
+  };
+}
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    /** Optional injected OpenAI-compatible client. Defaults to a fresh
+     *  client built from `MINIMAX_API_KEY` + `MINIMAX_BASE_URL`. */
+    minimaxClient?: OpenAIClient;
+    /** Optional injected dedup provider. Defaults to a Firestore-backed
+     *  implementation that queries `users/{uid}/conversations`. */
+    minimaxDedupProvider?: DedupProvider;
+  }
+}
+
+// `fp()` lifts the route out of Fastify's default plugin encapsulation
+// so decorations like `firebaseAdmin`, `minimaxClient`, and
+// `minimaxDedupProvider` are visible to the route regardless of where
+// they are decorated. Same pattern as the firebase plugin.
+export default fp(importRoute) as FastifyPluginAsync;
