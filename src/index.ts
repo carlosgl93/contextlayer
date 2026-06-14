@@ -4,6 +4,8 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import firebasePlugin from './plugins/firebase';
 import importRoute from './routes/import';
+import conversationsRoute from './routes/conversations';
+import privacyRoute from './routes/privacy';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -41,6 +43,8 @@ async function main() {
   app.get('/health', async () => ({ status: 'ok' }));
 
   await app.register(importRoute);
+  await app.register(conversationsRoute);
+  await app.register(privacyRoute);
 
   try {
     await app.listen({ port: PORT, host: HOST });
