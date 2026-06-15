@@ -7,5 +7,12 @@ dist/
 # Founder export fixture for local import-pipeline testing only.
 # Never commit real conversation exports to source control.
 data-*-batch-*.zip
+data-*-batch-*/
 *.export.zip
 fixtures/private/
+
+# macOS filesystem metadata
+.DS_Store
+
+# One-shot diagnostic scripts kept on disk for ad-hoc replays
+scripts/probe-minimax.ts
