@@ -6,6 +6,7 @@ import firebasePlugin from './plugins/firebase';
 import importRoute from './routes/import';
 import conversationsRoute from './routes/conversations';
 import privacyRoute from './routes/privacy';
+import profileRoute from './routes/profile';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -45,6 +46,7 @@ async function main() {
   await app.register(importRoute);
   await app.register(conversationsRoute);
   await app.register(privacyRoute);
+  await app.register(profileRoute);
 
   try {
     await app.listen({ port: PORT, host: HOST });
