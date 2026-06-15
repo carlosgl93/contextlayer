@@ -87,6 +87,22 @@ const SCHEMA_REMINDER = `Schema:
 
 \`source\` must be the exact title of the conversation the signal came from (the text between the "===" markers). Return ONLY the JSON object, no other text.`;
 
+/**
+ * Parses the content of an extraction LLM response into a JSON value.
+ *
+ * MiniMax-M3 wraps its JSON output in one or more `think` blocks
+ * (opening tag: `<think>`, closing: `</think>`) before the payload.
+ * The regex is non-greedy and global so multiple blocks are all stripped.
+ * Whitespace around the payload is trimmed.
+ *
+ * Throws if the remaining text is not valid JSON. Callers should catch
+ * and treat that as a batch-level failure (empty arrays for that batch).
+ */
+export function parseExtractionResponse(content: string): unknown {
+  const stripped = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  return JSON.parse(stripped);
+}
+
 function isSignalArray(v: unknown): v is ExtractionSignal[] {
   return (
     Array.isArray(v) &&
@@ -198,7 +214,7 @@ export async function extractContextSignals(opts: ExtractOptions): Promise<Extra
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(content);
+      parsed = parseExtractionResponse(content);
     } catch {
       // Malformed JSON — log and continue.
       continue;

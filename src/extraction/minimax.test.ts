@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   extractContextSignals,
+  parseExtractionResponse,
   type DedupProvider,
   type OpenAIClient,
 } from './minimax';
@@ -199,6 +200,32 @@ test('extract: bad JSON response from LLM → empty arrays for that batch, no th
   assert.equal(r.domainsOfInterest.length, 0);
 });
 
+test('extract: M3 response wrapped in a think block is parsed and signals returned', async () => {
+  // M3 emits a think block before the JSON payload. The 11-batch live
+  // calibration returned this wrapper on every batch and silently parse-failed.
+  const OPEN = '<' + 'think' + '>';
+  const CLOSE = '<' + '/' + 'think' + '>';
+  const inner = JSON.stringify({
+    preferences: [{ value: 'likes X', source: 'A title' }],
+    personalFacts: [],
+    activeIntentions: [],
+    domainsOfInterest: [],
+  });
+  const content = `\n\n${OPEN}\n\n  Thought for 1s\n\n${CLOSE}\n${inner}`;
+  const client = makeFakeOpenAI({ content });
+  const r = await extractContextSignals({
+    uid: 'u1',
+    provider: 'claude',
+    conversations: [makeConversation()],
+    openaiClient: client,
+    dedup: makeDedup(),
+  });
+  assert.equal(r.preferences.length, 1);
+  assert.equal(r.preferences[0].value, 'likes X');
+  assert.equal(r.preferences[0].source, 'A title');
+  assert.equal(r.preferences[0].provider, 'claude');
+});
+
 test('extract: batch of 25 with MINIMAX_BATCH_SIZE_CHATGPT=10 → 3 calls (10+10+5)', async () => {
   const prevBatch = process.env.MINIMAX_BATCH_SIZE_CHATGPT;
   process.env.MINIMAX_BATCH_SIZE_CHATGPT = '10';
@@ -319,3 +346,60 @@ test('extract: LLM network failure propagates as an error', async () => {
 function emptyResult(): ExtractionResult {
   return { preferences: [], personalFacts: [], activeIntentions: [], domainsOfInterest: [] };
 }
+
+// --- parseExtractionResponse unit tests ------------------------------------
+//
+// The M3 API returns its JSON payload wrapped in one or more <think>…</think>
+// blocks. parseExtractionResponse strips those blocks and parses the rest as
+// JSON. These tests pin the contract at the helper level so a future regression
+// fails here, not deep inside the per-batch loop.
+
+function thinkOpen(): string {
+  return '<' + 'think' + '>';
+}
+function thinkClose(): string {
+  return '<' + '/' + 'think' + '>';
+}
+
+test('parseExtractionResponse: strips a single think block before the JSON', () => {
+  const inner = JSON.stringify({ preferences: [{ value: 'v', source: 's' }] });
+  const content = `\n\n${thinkOpen()}\n\n  Thought for 1s\n\n${thinkClose()}\n${inner}`;
+  const parsed = parseExtractionResponse(content) as Record<string, unknown>;
+  assert.ok(parsed);
+  assert.deepEqual(parsed.preferences, [{ value: 'v', source: 's' }]);
+});
+
+test('parseExtractionResponse: strips multiple think blocks', () => {
+  const inner = JSON.stringify({ preferences: [], personalFacts: [], activeIntentions: [], domainsOfInterest: [] });
+  const content =
+    `${thinkOpen()}first reasoning${thinkClose()}\n` +
+    `${thinkOpen()}second reasoning${thinkClose()}\n` +
+    inner;
+  const parsed = parseExtractionResponse(content) as Record<string, unknown>;
+  assert.ok(parsed);
+  assert.deepEqual(Object.keys(parsed).sort(), ['activeIntentions', 'domainsOfInterest', 'personalFacts', 'preferences']);
+});
+
+test('parseExtractionResponse: raw JSON without a think block still parses', () => {
+  const inner = JSON.stringify({ preferences: [{ value: 'v', source: 's' }] });
+  const parsed = parseExtractionResponse(inner) as Record<string, unknown>;
+  assert.ok(parsed);
+  assert.deepEqual(parsed.preferences, [{ value: 'v', source: 's' }]);
+});
+
+test('parseExtractionResponse: trims surrounding whitespace', () => {
+  const inner = JSON.stringify({ preferences: [] });
+  const content = `   \n\n  ${inner}  \n\n  `;
+  const parsed = parseExtractionResponse(content) as Record<string, unknown>;
+  assert.ok(parsed);
+  assert.deepEqual(parsed.preferences, []);
+});
+
+test('parseExtractionResponse: throws on malformed JSON after stripping', () => {
+  const content = `${thinkOpen()}\nrandom thought\n${thinkClose()}\nthis is not json`;
+  assert.throws(() => parseExtractionResponse(content), /JSON/);
+});
+
+test('parseExtractionResponse: throws on malformed JSON with no think block', () => {
+  assert.throws(() => parseExtractionResponse('not json at all'), /JSON/);
+});
