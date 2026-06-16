@@ -533,7 +533,7 @@ Todos los deletes responden `{ deleted: true }`. Operaciones sobre datos inexist
 
 ## Dependencies / Assumptions
 
-- Firebase project: **\`sg-cloud-cefee\`** — ya existente con Cloud Functions y colecciones Firestore propias. ContextLayer escribe solo bajo el namespace \`users/{uid}/\`; no tocar ni eliminar colecciones ni funciones existentes.
+- Firebase project: **\`context-layer-93a65\`** — nuevo, sin Cloud Functions ni colecciones previas. ContextLayer escribe solo bajo el namespace `users/{uid}/`; no tocar ni eliminar colecciones ni funciones existentes.
 - Credenciales del Admin SDK: \`FIREBASE_SERVICE_ACCOUNT\` env var (JSON de service account en base64). Descargar desde Firebase Console > Project Settings > Service Accounts > Generate new private key.
 - API key MiniMax (`sk-cp-...`) puede ser proxy — probar `https://api.minimax.io/v1` primero; fallback a `https://www.minimax-api.com/v1` si la auth falla (U5).
 - Formato del ZIP de Claude estable a junio 2026; `conversations.json` es el archivo raiz.
