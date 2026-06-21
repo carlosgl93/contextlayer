@@ -148,8 +148,26 @@ test('admin SDK helpers: tenant config writes are scoped to b2bTenants/{tenantId
 
 test('admin SDK helpers: cross-tenant read cannot see another tenants config', async () => {
   const fake = makeFakeFirestore() as unknown as Firestore;
-  await writeTenantConfigForTest(fake, 'acme', { systemPrompt: 'Acme secret' });
-  await writeTenantConfigForTest(fake, 'globex', { systemPrompt: 'Globex secret' });
+  const acmeConfig: TenantConfigShape = {
+    systemPrompt: 'Acme secret',
+    branding: { primaryColor: '#0066cc', logoUrl: null, displayName: 'Acme' },
+    allowedProviders: ['openai'],
+    defaultProvider: 'openai',
+    rateLimit: { messagesPerVisitorPerDay: 100 },
+    allowedOrigins: ['https://acme.com'],
+    updatedAt: new Date(),
+  };
+  const globexConfig: TenantConfigShape = {
+    systemPrompt: 'Globex secret',
+    branding: { primaryColor: '#ff6600', logoUrl: null, displayName: 'Globex' },
+    allowedProviders: ['openai'],
+    defaultProvider: 'openai',
+    rateLimit: { messagesPerVisitorPerDay: 100 },
+    allowedOrigins: ['https://globex.com'],
+    updatedAt: new Date(),
+  };
+  await writeTenantConfigForTest(fake, 'acme', acmeConfig);
+  await writeTenantConfigForTest(fake, 'globex', globexConfig);
 
   const acmeRead = await readTenantConfigForTest(fake, 'acme');
   const globexRead = await readTenantConfigForTest(fake, 'globex');
