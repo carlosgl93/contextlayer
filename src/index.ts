@@ -9,6 +9,7 @@ import privacyRoute from './routes/privacy';
 import profileRoute from './routes/profile';
 import widgetConfigRoute from './routes/widget-config';
 import widgetSessionCheckRoute from './routes/widget-session-check';
+import widgetChatRoute from './routes/widget-chat';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -51,6 +52,7 @@ async function main() {
   await app.register(profileRoute);
   await app.register(widgetConfigRoute);
   await app.register(widgetSessionCheckRoute);
+  await app.register(widgetChatRoute);
 
   try {
     await app.listen({ port: PORT, host: HOST });
